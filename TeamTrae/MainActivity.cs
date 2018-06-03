@@ -45,15 +45,8 @@ namespace TeamTrae
             FloatingActionButton fab = FindViewById<FloatingActionButton>(Resource.Id.fab);
             fab.Click += FabOnClick;
 
-            var lmgr = (LocationManager)ApplicationContext.GetSystemService(Context.LocationService);
-            lmgr.RequestLocationUpdates(LocationManager.GpsProvider, 0, 0, new MyLocationListener(this));
 
             _camhandler = new MyCameraHandler(this);
-
-            //            _timer = new Timer(10000);
-            //            _timer.AutoReset = true;
-            //            _timer.Elapsed += HandleTimerTick;
-            //            _timer.Start();
 
             _timerhandler = new Handler(this.MainLooper);
             _mytimer = new Runnable(() =>
@@ -69,7 +62,6 @@ namespace TeamTrae
         private Handler _timerhandler;
         private Runnable _mytimer;
         private MyCameraHandler _camhandler;
-        private Location _lastKnownLocation;
 
         private void HandleTimerTick(object sender, EventArgs args)
         {
@@ -98,10 +90,16 @@ namespace TeamTrae
         private class MyCameraHandler
         {
             private HandlerThread _handlerThread;
+            private CaptureWrapper _capture;
+            private bool _lastCaptureComplete;
+            private MyLocationListener _locationProvider;
+            private LocationWrapper _lastKnownLocation;
 
             public MyCameraHandler(MainActivity activity)
             {
                 Activity = activity;
+                _locationProvider = new MyLocationListener(activity);
+                _locationProvider.OnLocationUpdated += HandleLocationUpdated;
 
                 _handlerThread = new HandlerThread("MyCameraHandler");
                 _handlerThread.Start();
@@ -110,6 +108,234 @@ namespace TeamTrae
             public ImageReader Target { get; private set; }
             public MainActivity Activity { get; }
             public int Rotation { get; set; }
+
+            public void TakePhoto()
+            {
+                var reuseCaptureSession = _lastCaptureComplete;
+
+                _lastCaptureComplete = false;
+
+                if (reuseCaptureSession)
+                {
+                    new Handler(_handlerThread.Looper).Post(CapturePhoto);
+                }
+                else
+                {
+                    var cmgr = (CameraManager)Activity.ApplicationContext.GetSystemService(Context.CameraService);
+                    var ids = cmgr.GetCameraIdList();
+                    cmgr.OpenCamera(ids[0], new MyCameraDeviceStateCallback(this), new Handler(_handlerThread.Looper));
+                }
+            }
+
+            private void CapturePhoto()
+            {
+                var orientation = Activity.WindowManager.DefaultDisplay.Rotation;
+                this.Rotation = (orientation == SurfaceOrientation.Rotation90) ? 0 : 180;
+
+                _capture.TakePhoto(Target, _lastKnownLocation?.Location, Rotation);
+            }
+
+            private void OnUploadComplete(string message)
+            {
+                SetUIText(Resource.Id.netstatus, "N", message);
+            }
+
+            private void OnCaptureComplete()
+            {
+                _lastCaptureComplete = true;
+                SetUIText(Resource.Id.status, "S", "Capture complete");
+
+                if (_lastKnownLocation == null)
+                {
+                    SetLocationText("No Location Available");
+                }
+
+                if (_lastKnownLocation != null && _lastKnownLocation.Timestamp.AddMinutes(2) < DateTime.Now)
+                {
+                    SetLocationText("Out-of-date");
+                }
+            }
+
+            private void OnError(string message)
+            {
+                SetUIText(Resource.Id.status, "S", message);
+            }
+
+            private void OnNetworkError(string message)
+            {
+                SetUIText(Resource.Id.netstatus, "N", message);
+            }
+
+            private void SetLocationText(string message)
+            {
+                SetUIText(Resource.Id.locstatus, "L", message);
+            }
+
+            private void SetUIText(int id, string prefix, string msg)
+            {
+                var statustext = Activity.FindViewById<TextView>(id);
+
+                Activity.RunOnUiThread(() =>
+                {
+                    var time = DateTime.Now.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
+                    statustext.Text = $"{prefix}:{time}:{msg}";
+                });
+            }
+
+            private void OnCameraDeviceOpened(CameraDevice camera)
+            {
+                try
+                {
+                    Target = ImageReader.NewInstance(1280, 720, Android.Graphics.ImageFormatType.Jpeg, 2);
+                    Target.SetOnImageAvailableListener(new MyImageAvailableCallback(this), null);
+                    var outputSurfaces = new List<Surface>()
+                    {
+                       Target.Surface
+                    };
+
+                    camera.CreateCaptureSession(outputSurfaces, new MySessionStateCallback(this), null);
+                }
+                catch (System.Exception sex)
+                {
+                    OnError("Failed to create session: " + sex.Message);
+                }
+            }
+
+            private void OnSessionConfigured(CameraCaptureSession session)
+            {
+                _capture = new CaptureWrapper(session, new MyCaptureCallback(this));
+                CapturePhoto();
+            }
+
+            private void OnImageAvailable(ImageReader reader)
+            {
+                Image image = reader.AcquireNextImage();
+
+                ByteBuffer buffer = image.GetPlanes()[0].Buffer;
+                byte[] bytes = new byte[buffer.Capacity()];
+                buffer.Get(bytes);
+
+                SendPhotoToServer(bytes);
+
+                Bitmap bitmap = BitmapFactory.DecodeByteArray(bytes, 0, bytes.Length);
+                var imgview = Activity.FindViewById<ImageView>(Resource.Id.theimage);
+
+                Activity.RunOnUiThread(() =>
+                {
+                    imgview.SetImageBitmap(bitmap);
+                    imgview.Rotation = Rotation; //  == 90 ? 0 : 180;
+                });
+
+                image.Close();
+            }
+
+            private bool SendPhotoToServer(byte[] data)
+            {
+                try
+                {
+                    var req = (HttpWebRequest)WebRequest.Create("https://teamtrae.azurewebsites.net/api/Photo");
+
+                    req.Method = "POST";
+
+                    var b64 = Convert.ToBase64String(data);
+                    var b64bin = System.Text.Encoding.ASCII.GetBytes(b64);
+
+                    using (var sw = new StreamWriter(req.GetRequestStream()))
+                    {
+                        sw.Write(b64);
+                    }
+
+                    var resp = req.GetResponse();
+                    return true;
+                }
+                catch (System.Exception e)
+                {
+                    OnNetworkError(e.Message);
+                    return false;
+                }
+            }
+
+            private void HandleLocationUpdated(Location loc)
+            {
+                _lastKnownLocation = new LocationWrapper(loc);
+                SetUIText(Resource.Id.locstatus, "L", loc.ToString());
+            }
+
+            private class CaptureWrapper
+            {
+                private readonly CameraCaptureSession _session;
+                private readonly CameraCaptureSession.CaptureCallback _captureCallback;
+
+                public CaptureWrapper(CameraCaptureSession session, CameraCaptureSession.CaptureCallback captureCallback)
+                {
+                    _session = session;
+                    _captureCallback = captureCallback;
+                }
+
+                private CaptureRequest BuildCaptureRequest(ImageReader target, Location location, int rotation)
+                {
+                    var reqBuilder = _session.Device.CreateCaptureRequest(CameraTemplate.StillCapture);
+                    reqBuilder.AddTarget(target.Surface);
+
+                    // Focus
+                    reqBuilder.Set(CaptureRequest.ControlAfMode, new Java.Lang.Integer((int)ControlAFMode.ContinuousPicture));
+
+                    // GPS Location
+                    if (location != null)
+                    {
+                        reqBuilder.Set(CaptureRequest.JpegGpsLocation, location);
+                    }
+
+                    reqBuilder.Set(CaptureRequest.JpegOrientation, new Java.Lang.Integer(rotation));
+
+                    return reqBuilder.Build();
+                }
+
+                public void TakePhoto(ImageReader target, Location location, int rotation)
+                {
+                    var req = BuildCaptureRequest(target, location, rotation);
+                    _session.Capture(req, _captureCallback, null);
+                }
+            }
+
+            private class LocationWrapper
+            {
+                public LocationWrapper(Location loc)
+                {
+                    Location = loc;                    
+                }
+
+                public DateTime Timestamp { get; } = DateTime.Now;
+
+                public Location Location { get; }
+            }
+
+
+            private class MyCameraDeviceStateCallback : CameraDevice.StateCallback
+            {
+                private readonly MyCameraHandler _owner;
+
+                public MyCameraDeviceStateCallback(MyCameraHandler owner)
+                {
+                    _owner = owner;
+                }
+
+                public override void OnDisconnected(CameraDevice camera)
+                {
+                    _owner.OnError("Camera Device disconnected");
+                }
+
+                public override void OnError(CameraDevice camera, [GeneratedEnum] Android.Hardware.Camera2.CameraError error)
+                {
+                    _owner.OnError("Camera Device error: " + error.ToString());
+                }
+
+                public override void OnOpened(CameraDevice camera)
+                {
+                    _owner.OnCameraDeviceOpened(camera);
+                }
+            }
+
 
             private class MyCaptureCallback : CameraCaptureSession.CaptureCallback
             {
@@ -122,48 +348,18 @@ namespace TeamTrae
 
                 public override void OnCaptureCompleted(CameraCaptureSession session, CaptureRequest request, TotalCaptureResult result)
                 {
+                    _owner.OnCaptureComplete();
                 }
 
                 public override void OnCaptureFailed(CameraCaptureSession session, CaptureRequest request, CaptureFailure failure)
                 {
-                    _owner._session = null;
+                    _owner.OnError("Capture Failed: " + failure.ToString());
                 }
             }
 
-            private CameraCaptureSession _session;
-            private CaptureRequest _request;
-
-            private CaptureRequest BuildCaptureRequest(CameraCaptureSession session)
-            {
-                var reqBuilder = session.Device.CreateCaptureRequest(CameraTemplate.StillCapture);
-                reqBuilder.AddTarget(Target.Surface);
-
-                // Focus
-                reqBuilder.Set(CaptureRequest.ControlAfMode, new Java.Lang.Integer((int)ControlAFMode.ContinuousPicture));
-
-                // GPS Location
-                var location = Activity._lastKnownLocation;
-                if (location != null)
-                {
-                    reqBuilder.Set(CaptureRequest.JpegGpsLocation, location);
-                }
-
-                var orientation = Activity.WindowManager.DefaultDisplay.Rotation;
-                Rotation = (orientation == SurfaceOrientation.Rotation90) ? 0 : 180;
-                reqBuilder.Set(CaptureRequest.JpegOrientation, new Java.Lang.Integer(Rotation));
-
-                return reqBuilder.Build();
-            }
-
-            private void TakePhoto(CameraCaptureSession session, CaptureRequest request)
-            {
-                var cb = new MyCaptureCallback(this);
-                session.Capture(request, cb, null);
-            }
 
             private class MySessionStateCallback : CameraCaptureSession.StateCallback
             {
-
                 private readonly MyCameraHandler _owner;
 
                 public MySessionStateCallback(MyCameraHandler owner)
@@ -173,35 +369,12 @@ namespace TeamTrae
 
                 public override void OnConfigured(CameraCaptureSession session)
                 {
-                    _owner._session = session;
-                    _owner._request = _owner.BuildCaptureRequest(session);
-                    _owner.TakePhoto(_owner._session, _owner._request);
-                    return;
-
-                    var reqBuilder = session.Device.CreateCaptureRequest(CameraTemplate.StillCapture);
-                    reqBuilder.AddTarget(_owner.Target.Surface);
-
-                    // Focus
-                    reqBuilder.Set(CaptureRequest.ControlAfMode, new Java.Lang.Integer((int)ControlAFMode.ContinuousPicture));
-
-                    // GPS Location
-                    var location = _owner.Activity._lastKnownLocation;
-                    if (location != null)
-                    {
-                        reqBuilder.Set(CaptureRequest.JpegGpsLocation, location);
-                    }
-
-                    var orientation = _owner.Activity.WindowManager.DefaultDisplay.Rotation;
-                    _owner.Rotation = (orientation == SurfaceOrientation.Rotation90) ? 0 : 180;
-                    reqBuilder.Set(CaptureRequest.JpegOrientation, new Java.Lang.Integer(_owner.Rotation));
-
-                    var cb = new MyCaptureCallback(_owner);
-                    session.Capture(reqBuilder.Build(), cb, null);
+                    _owner.OnSessionConfigured(session);
                 }
 
                 public override void OnConfigureFailed(CameraCaptureSession session)
                 {
-                    _owner._session = null;
+                    _owner.OnError("Session Configuration failed");
                 }
             }
 
@@ -216,119 +389,47 @@ namespace TeamTrae
 
                 public void OnImageAvailable(ImageReader reader)
                 {
-                    Image image = reader.AcquireNextImage();
-
-                    ByteBuffer buffer = image.GetPlanes()[0].Buffer;
-                    byte[] bytes = new byte[buffer.Capacity()];
-                    buffer.Get(bytes);
-
-                    SendPhotoToServer(bytes);
-
-                    Bitmap bitmap = BitmapFactory.DecodeByteArray(bytes, 0, bytes.Length);
-                    var imgview = _owner.Activity.FindViewById<ImageView>(Resource.Id.theimage);
-
-                    _owner.Activity.RunOnUiThread(() =>
-                    {
-                        imgview.SetImageBitmap(bitmap);
-                        imgview.Rotation = _owner.Rotation; //  == 90 ? 0 : 180;
-                    });
-
-                    image.Close();
-                }
-
-                private bool SendPhotoToServer(byte[] data)
-                {
-                    try
-                    {
-                        var req = (HttpWebRequest)WebRequest.Create("https://teamtrae.azurewebsites.net/api/Photo");
-
-                        req.Method = "POST";
-
-                        var b64 = Convert.ToBase64String(data);
-                        var b64bin = System.Text.Encoding.ASCII.GetBytes(b64);
-
-                        using (var sw = new StreamWriter(req.GetRequestStream()))
-                        {
-                            sw.Write(b64);
-                        }
-
-                        var resp = req.GetResponse();
-                        return true;
-                    }
-                    catch (System.Exception e)
-                    {
-                        return false;
-                    }
+                    _owner.OnImageAvailable(reader);
                 }
             }
 
-            private class MyStateCallback : CameraDevice.StateCallback
-            {
-                private readonly MyCameraHandler _owner;
 
-                public MyStateCallback(MyCameraHandler owner)
-                {
-                    _owner = owner;
-                }
-
-                public override void OnDisconnected(CameraDevice camera)
-                {
-                    _owner._session = null;
-                }
-
-                public override void OnError(CameraDevice camera, [GeneratedEnum] Android.Hardware.Camera2.CameraError error)
-                {
-                    _owner._session = null;
-                }
-
-                public override void OnOpened(CameraDevice camera)
-                {
-                    try
-                    {
-                        // var req = camera.CreateCaptureRequest(CameraTemplate.StillCapture);
-                        _owner.Target = ImageReader.NewInstance(1280, 720, Android.Graphics.ImageFormatType.Jpeg, 2);
-                        _owner.Target.SetOnImageAvailableListener(new MyImageAvailableCallback(_owner), null);
-                        var outputSurfaces = new List<Surface>()
-                    {
-                       _owner.Target.Surface
-                    };
-
-                        camera.CreateCaptureSession(outputSurfaces, new MySessionStateCallback(_owner), null);
-                    }
-                    catch
-                    {
-                        _owner._session = null;
-                    }
-                }
-            }
-
-            public void TakePhoto()
-            {
-                if (_session == null)
-                {
-                    var cmgr = (CameraManager)Activity.ApplicationContext.GetSystemService(Context.CameraService);
-                    var ids = cmgr.GetCameraIdList();
-                    cmgr.OpenCamera(ids[0], new MyStateCallback(this), new Handler(_handlerThread.Looper));
-                }
-                else
-                {
-                    new Handler(_handlerThread.Looper).Post(() => TakePhoto(this._session, this._request));
-                }
-            }
         }
 
         private class MyLocationListener : Java.Lang.Object, ILocationListener
         {
+            private LocationManager _lmgr;
+
             public MyLocationListener(MainActivity activity)
             {
                 Activity = activity;
+                _lmgr = (LocationManager)activity.ApplicationContext.GetSystemService(Context.LocationService);
+                Subscribe();
+            }
+
+            private void Restart()
+            {
+                UnSubscribe();
+                Subscribe();
+            }
+
+            private void Subscribe()
+            {
+                _lmgr.RequestLocationUpdates(LocationManager.GpsProvider, 0, 0, this);
+            }
+
+            private void UnSubscribe()
+            {
+                _lmgr.RemoveUpdates(this);
             }
 
             public MainActivity Activity { get; }
 
+            public event Action<Location> OnLocationUpdated;
+
             public void OnLocationChanged(Location location)
             {
-                Activity._lastKnownLocation = location;
+                OnLocationUpdated?.Invoke(location);
             }
 
             public void OnProviderDisabled(string provider)

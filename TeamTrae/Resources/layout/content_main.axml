@@ -13,12 +13,18 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Countdown: " />
+            android:text="S: "
+            android:id="@+id/status" />
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Countup: "
-            android:id="@+id/theheadline" />
+            android:text="N: "
+            android:id="@+id/netstatus" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="N: "
+            android:id="@+id/locstatus" />
         <ImageView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
