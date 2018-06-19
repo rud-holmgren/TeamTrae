@@ -26,6 +26,7 @@ using System.Timers;
 using System.Net;
 using System.IO;
 using Java.Lang;
+using System.Linq;
 
 namespace TeamTrae
 {
@@ -53,8 +54,15 @@ namespace TeamTrae
             {
                 if (this.IsDestroyed) { return; }
 
-                _camhandler.TakePhoto();
-                _timerhandler.PostDelayed(_mytimer, 10000);
+                try
+                {
+                    _camhandler.TakePhoto();
+                    _timerhandler.PostDelayed(_mytimer, 10000);
+                }
+                catch (System.Exception e)
+                {
+                    _camhandler.OnError("MainLoop: " + e.Message);
+                }
             });
             _timerhandler.PostDelayed(_mytimer, 1000);
         }
@@ -62,11 +70,6 @@ namespace TeamTrae
         private Handler _timerhandler;
         private Runnable _mytimer;
         private MyCameraHandler _camhandler;
-
-        private void HandleTimerTick(object sender, EventArgs args)
-        {
-            _camhandler.TakePhoto();
-        }
 
         public override bool OnCreateOptionsMenu(IMenu menu)
         {
@@ -94,12 +97,18 @@ namespace TeamTrae
             private bool _lastCaptureComplete;
             private MyLocationListener _locationProvider;
             private LocationWrapper _lastKnownLocation;
+            private PhotoUploader _uploader;
 
             public MyCameraHandler(MainActivity activity)
             {
                 Activity = activity;
+
+                _lastKnownLocation = new LocationWrapper(null);
                 _locationProvider = new MyLocationListener(activity);
                 _locationProvider.OnLocationUpdated += HandleLocationUpdated;
+
+                _uploader = new PhotoUploader();
+                _uploader.OnStateChanged += SetNetworkStatus;
 
                 _handlerThread = new HandlerThread("MyCameraHandler");
                 _handlerThread.Start();
@@ -135,7 +144,7 @@ namespace TeamTrae
                 _capture.TakePhoto(Target, _lastKnownLocation?.Location, Rotation);
             }
 
-            private void OnUploadComplete(string message)
+            private void SetNetworkStatus(string message)
             {
                 SetUIText(Resource.Id.netstatus, "N", message);
             }
@@ -145,18 +154,14 @@ namespace TeamTrae
                 _lastCaptureComplete = true;
                 SetUIText(Resource.Id.status, "S", "Capture complete");
 
-                if (_lastKnownLocation == null)
-                {
-                    SetLocationText("No Location Available");
-                }
-
-                if (_lastKnownLocation != null && _lastKnownLocation.Timestamp.AddMinutes(2) < DateTime.Now)
+                if (_lastKnownLocation != null && _lastKnownLocation.Timestamp.AddSeconds(30) < DateTime.Now)
                 {
                     SetLocationText("Out-of-date");
+                    _locationProvider.Reset();
                 }
             }
 
-            private void OnError(string message)
+            public void OnError(string message)
             {
                 SetUIText(Resource.Id.status, "S", message);
             }
@@ -203,62 +208,51 @@ namespace TeamTrae
 
             private void OnSessionConfigured(CameraCaptureSession session)
             {
-                _capture = new CaptureWrapper(session, new MyCaptureCallback(this));
-                CapturePhoto();
+                try
+                {
+                    _capture = new CaptureWrapper(session, new MyCaptureCallback(this));
+                    CapturePhoto();
+                }
+                catch (System.Exception e)
+                {
+                    OnError("Failed to wrap session: " + e.Message);
+                }
             }
 
             private void OnImageAvailable(ImageReader reader)
             {
-                Image image = reader.AcquireNextImage();
-
-                ByteBuffer buffer = image.GetPlanes()[0].Buffer;
-                byte[] bytes = new byte[buffer.Capacity()];
-                buffer.Get(bytes);
-
-                SendPhotoToServer(bytes);
-
-                Bitmap bitmap = BitmapFactory.DecodeByteArray(bytes, 0, bytes.Length);
-                var imgview = Activity.FindViewById<ImageView>(Resource.Id.theimage);
-
-                Activity.RunOnUiThread(() =>
-                {
-                    imgview.SetImageBitmap(bitmap);
-                    imgview.Rotation = Rotation; //  == 90 ? 0 : 180;
-                });
-
-                image.Close();
-            }
-
-            private bool SendPhotoToServer(byte[] data)
-            {
                 try
                 {
-                    var req = (HttpWebRequest)WebRequest.Create("https://teamtrae.azurewebsites.net/api/Photo");
+                    Image image = reader.AcquireNextImage();
 
-                    req.Method = "POST";
+                    ByteBuffer buffer = image.GetPlanes()[0].Buffer;
+                    byte[] bytes = new byte[buffer.Capacity()];
+                    buffer.Get(bytes);
 
-                    var b64 = Convert.ToBase64String(data);
-                    var b64bin = System.Text.Encoding.ASCII.GetBytes(b64);
+                    _uploader.Queue(bytes);
 
-                    using (var sw = new StreamWriter(req.GetRequestStream()))
+                    Bitmap bitmap = BitmapFactory.DecodeByteArray(bytes, 0, bytes.Length);
+                    var imgview = Activity.FindViewById<ImageView>(Resource.Id.theimage);
+
+                    Activity.RunOnUiThread(() =>
                     {
-                        sw.Write(b64);
-                    }
+                        imgview.SetImageBitmap(bitmap);
+                        imgview.Rotation = Rotation; //  == 90 ? 0 : 180;
+                    });
 
-                    var resp = req.GetResponse();
-                    return true;
+                    image.Close();
                 }
                 catch (System.Exception e)
                 {
-                    OnNetworkError(e.Message);
-                    return false;
+                    OnError("Failed to process image:" + e.Message);
                 }
             }
+
 
             private void HandleLocationUpdated(Location loc)
             {
                 _lastKnownLocation = new LocationWrapper(loc);
-                SetUIText(Resource.Id.locstatus, "L", loc.ToString());
+                SetLocationText(loc.ToString());
             }
 
             private class CaptureWrapper
@@ -302,7 +296,7 @@ namespace TeamTrae
             {
                 public LocationWrapper(Location loc)
                 {
-                    Location = loc;                    
+                    Location = loc;
                 }
 
                 public DateTime Timestamp { get; } = DateTime.Now;
@@ -407,7 +401,7 @@ namespace TeamTrae
                 Subscribe();
             }
 
-            private void Restart()
+            public void Reset()
             {
                 UnSubscribe();
                 Subscribe();
@@ -442,6 +436,127 @@ namespace TeamTrae
 
             public void OnStatusChanged(string provider, [GeneratedEnum] Availability status, Bundle extras)
             {
+            }
+        }
+
+
+        class PhotoUploader
+        {
+            private HandlerThread _handlerThread;
+            private Handler _uploadHandler;
+            private Queue<PhotoWrapper> _queue = new Queue<PhotoWrapper>();
+
+            private class PhotoWrapper
+            {
+                public PhotoWrapper(byte[] data)
+                {
+                    Data = data;
+                }
+
+                public byte[] Data { get; }
+                public int Length => Data.Length;
+            }
+
+            public PhotoUploader()
+            {                
+                _handlerThread = new HandlerThread("MyPhotoUploader");
+                _handlerThread.Start();
+
+                _uploadHandler = new Handler(_handlerThread.Looper);
+            }
+
+            public event Action<string> OnStateChanged;
+
+            private void UpdateState(string msg)
+            {
+                int nel, size;
+
+                lock (_queue)
+                {
+                    nel = _queue.Count;
+                    size = _queue.Sum(p => p.Length) / 1024;
+                }
+
+                msg += $" ({nel}/{size})";
+                OnStateChanged?.Invoke(msg);
+            }
+
+            public void Queue(byte[] data)
+            {
+                lock (_queue)
+                {
+                    _queue.Enqueue(new PhotoWrapper(data));
+                    TrimQueue();
+                }
+
+                _uploadHandler.Post(UploadQueue);
+            }
+
+            private void TrimQueue()
+            {
+
+            }
+
+            private PhotoWrapper Dequeue()
+            {
+                lock (_queue)
+                {
+                    return (_queue.Count > 0) ? _queue.Dequeue() : null;
+                }
+            }
+
+            private PhotoWrapper Peek()
+            {
+                lock (_queue)
+                {
+                    return (_queue.Count > 0) ? _queue.Peek() : null;
+                }
+            }
+
+            private void UploadQueue()
+            {
+                PhotoWrapper p;
+                string msg = null;
+                bool success = true;
+
+                while (success && (p = Peek()) != null)
+                {
+                    success = SendPhotoToServer(p.Data, out msg);
+
+                    if (success)
+                    {
+                        Dequeue();
+                    }
+
+                    UpdateState(msg);
+                }
+            }
+
+            private bool SendPhotoToServer(byte[] data, out string message)
+            {
+                try
+                {
+                    var req = (HttpWebRequest)WebRequest.Create("https://teamtrae.azurewebsites.net/api/Photo");
+
+                    req.Method = "POST";
+
+                    var b64 = Convert.ToBase64String(data);
+                    var b64bin = System.Text.Encoding.ASCII.GetBytes(b64);
+
+                    using (var sw = new StreamWriter(req.GetRequestStream()))
+                    {
+                        sw.Write(b64);
+                    }
+
+                    var resp = req.GetResponse();
+                    message = "OK";
+                    return true;
+                }
+                catch (System.Exception e)
+                {
+                    message = e.Message;
+                    return false;
+                }
             }
         }
 
