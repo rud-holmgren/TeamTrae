@@ -57,7 +57,7 @@ namespace TeamTrae
                 try
                 {
                     _camhandler.TakePhoto();
-                    _timerhandler.PostDelayed(_mytimer, 10000);
+                    _timerhandler.PostDelayed(_mytimer, 5000);
                 }
                 catch (System.Exception e)
                 {
